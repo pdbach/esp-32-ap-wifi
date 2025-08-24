@@ -1,0 +1,204 @@
+// ESP32_Reduced.ino
+// Lightweight All-in-one WiFi + BLE + BT Classic tester (smaller memory footprint)
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <BluetoothSerial.h>
+#include <BLEDevice.h>
+
+const char* ap_ssid = "ESP32_AP";
+const char* ap_pass = "esp32test"; // "" nếu muốn open AP
+const int LED_PIN = 2; // đổi nếu board khác
+
+WebServer server(80);
+BluetoothSerial BTSerial;
+bool btRunning = false;
+
+// BLE results (fixed-size)
+#define MAX_BLE 12
+struct BLEFound { char name[32]; char addr[18]; int rssi; };
+BLEFound bleList[MAX_BLE];
+int bleCount = 0;
+
+// minimal HTML (minified) to save RAM
+const char INDEX_HTML[] PROGMEM = R"rawliteral(
+<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ESP32 Mini Tester</title></head><body>
+<h3>ESP32 Mini Tester</h3>
+<div>IP:<span id=ip>...</span> LED:<span id=led>...</span></div>
+<button onclick="fetch('/toggle').then(()=>u())">Toggle LED</button>
+<hr>
+<button onclick="fetch('/scanwifi').then(r=>r.json()).then(j=>{document.getElementById('wifi').textContent=JSON.stringify(j)})">Scan WiFi</button>
+<pre id=wifi></pre>
+<input id=s1 placeholder='ssid'><input id=p1 placeholder='pass'><button onclick="fetch('/connect_sta?ssid='+encodeURIComponent(s1.value)+'&pass='+encodeURIComponent(p1.value)).then(r=>r.text()).then(t=>document.getElementById('sta').textContent=t)">Connect STA</button>
+<pre id=sta></pre>
+<hr>
+<button onclick="fetch('/scan_ble').then(r=>r.json()).then(j=>document.getElementById('ble').textContent=JSON.stringify(j))">Scan BLE</button>
+<pre id=ble></pre>
+<hr>
+<button onclick="fetch('/bt_start').then(r=>r.text()).then(t=>btres(t))">BT Start</button>
+<button onclick="fetch('/bt_stop').then(r=>r.text()).then(t=>btres(t))">BT Stop</button>
+<input id=btmsg placeholder='msg'><button onclick="fetch('/bt_send?msg='+encodeURIComponent(btmsg.value)).then(r=>r.text()).then(t=>btres(t))">Send</button>
+<pre id=bt></pre>
+<script>
+async function u(){
+  try{
+    const s=await fetch('/status'); const j=await s.json();
+    ip.textContent=j.ip||'--'; led.textContent=j.led?'ON':'OFF';
+  }catch(e){console.log(e)}
+}
+function btres(t){ bt.textContent = t; }
+setInterval(u,3000); u();
+</script>
+</body></html>
+)rawliteral";
+
+// --- Handlers ---
+void handleRoot(){ server.send_P(200, "text/html", INDEX_HTML); }
+
+void handleStatus(){
+  String mac = WiFi.macAddress();
+  String ip = WiFi.softAPIP().toString();
+  int led = digitalRead(LED_PIN);
+  int clients = WiFi.softAPgetStationNum();
+  String j = String("{\"mac\":\"") + mac + String("\",\"ip\":\"") + ip + String("\",\"led\":") + (led ? "1" : "0") + String(",\"clients\":") + String(clients) + String("}");
+  server.send(200, "application/json", j);
+}
+
+void handleToggle(){
+  int s = digitalRead(LED_PIN);
+  digitalWrite(LED_PIN, !s);
+  handleStatus();
+}
+
+// WiFi scan (limited)
+void handleScanWifi(){
+  int n = WiFi.scanNetworks(true);
+  while (WiFi.scanComplete() == -2) delay(10);
+  int c = WiFi.scanComplete();
+  if(c < 0) { server.send(200, "application/json", "[]"); return; }
+  int maxn = c > 20 ? 20 : c;
+  String j = "[";
+  for(int i=0;i<maxn;i++){
+    if(i) j += ",";
+    String ssid = WiFi.SSID(i);
+    int rssi = WiFi.RSSI(i);
+    int ch = WiFi.channel(i);
+    int enc = WiFi.encryptionType(i);
+    const char* encs = "OTH";
+    if(enc==WIFI_AUTH_OPEN) encs="OPEN";
+    else if(enc==WIFI_AUTH_WEP) encs="WEP";
+    else if(enc==WIFI_AUTH_WPA_PSK) encs="WPA";
+    else if(enc==WIFI_AUTH_WPA2_PSK) encs="WPA2";
+    j += String("{\"s\":\"") + ssid + String("\",\"r\":") + String(rssi) + String(",\"c\":") + String(ch) + String(",\"e\":\"") + encs + String("\"}");
+  }
+  j += "]";
+  WiFi.scanDelete();
+  server.send(200, "application/json", j);
+}
+
+// connect as STA (short timeout)
+void handleConnectSTA(){
+  String ssid = server.arg("ssid");
+  String pass = server.arg("pass");
+  if(ssid.length()==0){ server.send(400,"text/plain","ssid missing"); return; }
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true); delay(50);
+  WiFi.begin(ssid.c_str(), pass.c_str());
+  unsigned long start = millis();
+  bool ok=false;
+  while(millis()-start < 8000){
+    if(WiFi.status() == WL_CONNECTED){ ok=true; break; }
+    delay(200);
+  }
+  if(ok) server.send(200,"application/json", String("{\"connected\":1,\"ip\":\"")+WiFi.localIP().toString()+String("\"}"));
+  else server.send(200,"application/json", String("{\"connected\":0,\"status\":")+String(WiFi.status())+String("}"));
+}
+
+// start/stop AP
+void handleStopAP(){ WiFi.softAPdisconnect(true); server.send(200,"text/plain","ap stopped"); }
+void handleStartAP(){ if(strlen(ap_pass)>0) WiFi.softAP(ap_ssid, ap_pass); else WiFi.softAP(ap_ssid); server.send(200,"text/plain","ap started"); }
+
+// BLE scan (limited, 3s)
+void handleScanBLE(){
+  bleCount = 0;
+  BLEDevice::init("");
+  BLEScan* pScan = BLEDevice::getScan();
+  pScan->setActiveScan(true);
+  BLEScanResults res = pScan->start(3, false);
+  int total = res.getCount();
+  int m = total > MAX_BLE ? MAX_BLE : total;
+  for(int i=0;i<m;i++){
+    BLEAdvertisedDevice d = res.getDevice(i);
+    String nm = d.getName().c_str();
+    String addr = d.getAddress().toString().c_str();
+    int r = d.getRSSI();
+    nm.toCharArray(bleList[bleCount].name, sizeof(bleList[bleCount].name));
+    addr.toCharArray(bleList[bleCount].addr, sizeof(bleList[bleCount].addr));
+    bleList[bleCount].rssi = r;
+    bleCount++;
+  }
+  // build json
+  String j = "[";
+  for(int i=0;i<bleCount;i++){
+    if(i) j += ",";
+    j += String("{\"n\":\"")+bleList[i].name+String("\",\"a\":\"")+bleList[i].addr+String("\",\"r\":")+String(bleList[i].rssi)+String("}");
+  }
+  j += "]";
+  server.send(200, "application/json", j);
+}
+
+// BT Classic SPP
+void handleBTStart(){
+  if(!btRunning){
+    if(!BTSerial.begin("ESP32_MINI")) { server.send(500,"text/plain","bt fail"); return; }
+    btRunning = true;
+    server.send(200,"text/plain","bt started");
+  } else server.send(200,"text/plain","bt running");
+}
+void handleBTStop(){
+  if(btRunning){ BTSerial.end(); btRunning=false; server.send(200,"text/plain","bt stopped"); }
+  else server.send(200,"text/plain","bt not running");
+}
+void handleBTSend(){
+  String m = server.arg("msg");
+  if(!btRunning){ server.send(400,"text/plain","bt not running"); return; }
+  BTSerial.println(m);
+  server.send(200,"text/plain","sent");
+}
+
+// ---- setup/loop ----
+void setup(){
+  // Serial.begin(115200); // disable to save memory if not needed
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  // set AP IP if you want custom (optional)
+  // IPAddress local_ip(192,168,4,1); WiFi.softAPConfig(local_ip, local_ip, IPAddress(255,255,255,0));
+  if(strlen(ap_pass)>0) WiFi.softAP(ap_ssid, ap_pass);
+  else WiFi.softAP(ap_ssid);
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/toggle", HTTP_GET, handleToggle);
+  server.on("/scanwifi", HTTP_GET, handleScanWifi);
+  server.on("/connect_sta", HTTP_GET, handleConnectSTA);
+  server.on("/stop_ap", HTTP_GET, handleStopAP);
+  server.on("/start_ap", HTTP_GET, handleStartAP);
+  server.on("/scan_ble", HTTP_GET, handleScanBLE);
+  server.on("/bt_start", HTTP_GET, handleBTStart);
+  server.on("/bt_stop", HTTP_GET, handleBTStop);
+  server.on("/bt_send", HTTP_GET, handleBTSend);
+
+  server.begin();
+}
+
+void loop(){
+  server.handleClient();
+  if(btRunning && BTSerial.available()){
+    // echo to serial if you enabled Serial
+    String s = BTSerial.readStringUntil('\n');
+    // Serial.println(s);
+  }
+  delay(1);
+}
